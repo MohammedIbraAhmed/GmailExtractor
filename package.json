@@ -1,0 +1,21 @@
+{
+  "name": "email-extractor",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "fs": "^0.0.1-security",
+    "googleapis": "^140.0.0",
+    "imap": "^0.8.17",
+    "mailparser": "^3.7.1",
+    "mammoth": "^1.7.2",
+    "node-fetch": "^3.3.2",
+    "pdf-parse": "^1.1.1",
+    "xlsx": "^0.18.5"
+  }
+}

@@ -1,21 +1,23 @@
 {
   "name": "email-extractor",
-  "version": "1.0.0",
-  "main": "index.js",
+  "version": "2.0.0",
+  "description": "Builds a de-duplicated contact list (names, email addresses, phone numbers) from a Gmail mailbox and its PDF, Word and Excel attachments.",
+  "main": "extractEmails.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node extractEmails.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22"
   },
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
-    "fs": "^0.0.1-security",
-    "googleapis": "^140.0.0",
-    "imap": "^0.8.17",
-    "mailparser": "^3.7.1",
-    "mammoth": "^1.7.2",
-    "node-fetch": "^3.3.2",
-    "pdf-parse": "^1.1.1",
-    "xlsx": "^0.18.5"
+    "@googleapis/gmail": "^22.0.2",
+    "exceljs": "^4.4.0",
+    "libphonenumber-js": "^1.13.15",
+    "mailparser": "^3.14.1",
+    "mammoth": "^1.13.0",
+    "pdf-parse": "^2.4.5"
   }
 }

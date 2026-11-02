@@ -1,550 +1,157 @@
+#!/usr/bin/env node
+"use strict";
+
+// Builds a contact list (names, email addresses, phone numbers) from a Gmail
+// mailbox and its PDF, Word and Excel attachments. See README.md.
+
 const fs = require("fs");
 const path = require("path");
-const readline = require("readline");
-const { google } = require("googleapis");
-const { simpleParser } = require("mailparser");
-const mammoth = require("mammoth");
-const pdf = require("pdf-parse");
-const xlsx = require("xlsx");
+const { parseArgs } = require("util");
+const { isSupportedCountry } = require("libphonenumber-js/max");
+const { UserFacingError, connect, listMessageIds } = require("./lib/gmail");
+const { extractContacts } = require("./lib/run");
+const { writeContactsWorkbook, partialPathFor } = require("./lib/output");
 
-const TOKEN_PATH = "token.json";
-const MAX_LISTENERS = 20; // Set a higher limit for event listeners
-const EMAIL_START_DATE = "2000/01/01"; // Set this to the earliest possible date to fetch all emails
-const MAX_RETRIES = 5; // Number of retries for network errors
-const RETRY_DELAY = 2000; // Delay between retries in milliseconds
+const CREDENTIALS_PATH = path.join(__dirname, "credentials.json");
+const TOKEN_PATH = path.join(__dirname, "token.json");
+const DEFAULT_OUTPUT = path.join(__dirname, "extracted_emails.xlsx");
+const PROGRESS_EVERY = 100; // print progress every N emails
+const CHECKPOINT_EVERY = 500; // save partial results every N emails
 
-let emailData = []; // To store email data
-let attachmentPaths = []; // To store paths of attachments to delete
+const HELP = `Usage: node extractEmails.js [options]
 
-// Load client secrets from a local file.
-fs.readFile("credentials.json", (err, content) => {
-  if (err) return console.log("Error loading client secret file:", err);
-  authorize(JSON.parse(content), listLabels);
-});
+Options:
+  --query "<search>"   Only read emails matching a Gmail search,
+                       e.g. --query "after:2026/01/01" or --query "label:partners"
+  --output <file>      Where to save the results (default: extracted_emails.xlsx)
+  --no-attachments     Don't read PDF, Word and Excel attachments
+  --country <code>     Country for phone numbers written without a country code
+                       (two letters, default: PS)
+  --concurrency <n>    How many emails to download at the same time (1-20, default: 5)
+  --help               Show this help
+`;
 
-function authorize(credentials, callback) {
-  const { client_secret, client_id, redirect_uris } =
-    credentials.installed || credentials.web;
-  if (!redirect_uris || redirect_uris.length === 0) {
-    return console.error(
-      "Redirect URIs are not defined in the credentials.json"
-    );
-  }
-  const oAuth2Client = new google.auth.OAuth2(
-    client_id,
-    client_secret,
-    redirect_uris[0]
-  );
-
-  fs.readFile(TOKEN_PATH, (err, token) => {
-    if (err) return getNewToken(oAuth2Client, callback);
-    oAuth2Client.setCredentials(JSON.parse(token));
-    callback(oAuth2Client);
-  });
-}
-
-function getNewToken(oAuth2Client, callback) {
-  const authUrl = oAuth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: ["https://www.googleapis.com/auth/gmail.readonly"],
-  });
-  console.log("Authorize this app by visiting this url:", authUrl);
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  rl.question("Enter the code from that page here: ", (code) => {
-    rl.close();
-    oAuth2Client.getToken(code, (err, token) => {
-      if (err) return console.error("Error retrieving access token", err);
-      oAuth2Client.setCredentials(token);
-      fs.writeFile(TOKEN_PATH, JSON.stringify(token), (err) => {
-        if (err) return console.error(err);
-        console.log("Token stored to", TOKEN_PATH);
-      });
-      callback(oAuth2Client);
-    });
-  });
-}
-
-function listLabels(auth) {
-  const gmail = google.gmail({ version: "v1", auth });
-  gmail.users.labels.list({ userId: "me" }, (err, res) => {
-    if (err) return console.log("The API returned an error: " + err);
-    const labels = res.data.labels;
-    if (!labels || labels.length === 0) {
-      console.log("No labels found.");
-      return;
-    }
-    labels.forEach((label) => {
-      listMessagesFromLabel(auth, label.id);
-    });
-  });
-}
-
-function listMessagesFromLabel(auth, labelId) {
-  const gmail = google.gmail({ version: "v1", auth });
-  gmail.users.messages.list(
-    {
-      userId: "me",
-      labelIds: [labelId],
-      q: `after:${EMAIL_START_DATE.replace(/\//g, "-")}`, // Fetch emails since the start date
+function parseOptions(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      query: { type: "string" },
+      output: { type: "string" },
+      "no-attachments": { type: "boolean", default: false },
+      country: { type: "string", default: "PS" },
+      concurrency: { type: "string", default: "5" },
+      help: { type: "boolean", default: false },
     },
-    (err, res) => {
-      if (err) return console.log("The API returned an error: " + err);
-      const messages = res.data.messages;
-      if (!messages || messages.length === 0) {
-        console.log(`No messages found in label ${labelId}.`);
-        return;
+  });
+  const country = values.country.toUpperCase();
+  if (!isSupportedCountry(country)) {
+    throw new UserFacingError(`Unknown country code "${values.country}". Use a two-letter code such as PS or JO.`);
+  }
+  const concurrency = Number(values.concurrency);
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) {
+    throw new UserFacingError("--concurrency must be a whole number from 1 to 20.");
+  }
+  return {
+    help: values.help,
+    query: values.query,
+    output: values.output ? path.resolve(values.output) : DEFAULT_OUTPUT,
+    includeAttachments: !values["no-attachments"],
+    country,
+    concurrency,
+  };
+}
+
+async function main() {
+  const options = parseOptions(process.argv.slice(2));
+  if (options.help) {
+    console.log(HELP);
+    return;
+  }
+  const partialPath = partialPathFor(options.output);
+
+  const { gmail, ownAddresses } = await connect({ credentialsPath: CREDENTIALS_PATH, tokenPath: TOKEN_PATH });
+  console.log(`Signed in as ${ownAddresses[0]}.`);
+
+  console.log(options.query ? `Finding emails matching: ${options.query}` : "Finding all emails (Spam and Trash are skipped)...");
+  const ids = await listMessageIds(gmail, options.query, {
+    onPage: (count) => console.log(`  ${count} found so far...`),
+  });
+  if (ids.length === 0) {
+    console.log("No emails matched. Nothing was saved.");
+    return;
+  }
+
+  let stopRequested = false;
+  process.on("SIGINT", () => {
+    if (stopRequested) {
+      // Remove any half-written file before quitting.
+      for (const file of [options.output, partialPath]) fs.rmSync(`${file}.tmp`, { force: true });
+      console.log("\nStopped without saving.");
+      process.exit(130);
+    }
+    stopRequested = true;
+    console.log("\nStopping after the emails in progress, then saving. Press Ctrl+C again to quit without saving.");
+  });
+
+  console.log(`Reading ${ids.length} emails. Press Ctrl+C to stop early and keep what has been collected.`);
+  let checkpoint = Promise.resolve();
+  let checkpointWarned = false;
+  const result = await extractContacts({
+    gmail,
+    ids,
+    ownAddresses,
+    country: options.country,
+    includeAttachments: options.includeAttachments,
+    concurrency: options.concurrency,
+    shouldStop: () => stopRequested,
+    onProgress: ({ processed, total, contacts, failed, store }) => {
+      if (processed % PROGRESS_EVERY === 0 || processed === total) {
+        console.log(`  ${processed}/${total} emails read, ${contacts} contacts, ${failed} failed`);
       }
-      console.log(`Messages in label ${labelId}:`);
-      messages.forEach((message) => {
-        if (labelId === "SENT") {
-          getMessage(auth, message.id, "to");
-        } else {
-          getMessage(auth, message.id, "from");
-        }
-      });
-    }
-  );
-}
-
-async function getMessage(auth, messageId, emailType, retries = MAX_RETRIES) {
-  const gmail = google.gmail({ version: "v1", auth });
-  try {
-    const res = await gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "raw", // Ensure the raw format is requested
-    });
-    const msg = res.data;
-    if (!msg.raw) {
-      console.log("No raw data found for message:", messageId);
-      return;
-    }
-
-    try {
-      const parsed = await simpleParser(Buffer.from(msg.raw, "base64"));
-
-      let emails = [];
-      if (emailType === "from") {
-        const from = parsed.from.value[0];
-        emails.push({ name: from.name, email: from.address });
-        console.log("From:", from);
-      } else if (emailType === "to") {
-        const to = parsed.to.value.map((to) => ({
-          name: to.name,
-          email: to.address,
-        }));
-        emails = emails.concat(to);
-        console.log("To:", to.join(", "));
+      // Save partial results now and then, so a crash or power cut loses little.
+      if (processed % CHECKPOINT_EVERY === 0 && processed < total) {
+        const rows = store.toRows();
+        checkpoint = checkpoint
+          .then(() => writeContactsWorkbook(rows, partialPath))
+          .catch((err) => {
+            if (!checkpointWarned) console.warn(`  Could not save partial results: ${err.message}`);
+            checkpointWarned = true;
+          });
       }
+    },
+  });
+  await checkpoint;
 
-      // Extract phone numbers
-      const phoneNumbers = extractPhoneNumbers(parsed.text);
+  const rows = result.store.toRows();
+  if (result.stopped) {
+    await writeContactsWorkbook(rows, partialPath);
+    console.log(`\nStopped early after ${result.processed} of ${ids.length} emails.`);
+    console.log(`Saved ${rows.length} contacts to ${partialPath}`);
+    console.log(`(${options.output} was not changed.)`);
+    process.exitCode = 130;
+  } else {
+    await writeContactsWorkbook(rows, options.output);
+    fs.rmSync(partialPath, { force: true });
+    console.log(`\nDone. Saved ${rows.length} contacts to ${options.output}`);
+  }
 
-      // Store the emails in a data array
-      storeEmailsToData(emails, phoneNumbers);
-
-      if (parsed.attachments && parsed.attachments.length > 0) {
-        for (const attachment of parsed.attachments) {
-          if (attachment.filename) {
-            const filePath = saveAttachment(attachment);
-            const emailsInAttachment = await parseAttachments(filePath);
-            const phoneNumbersInAttachment =
-              extractPhoneNumbers(emailsInAttachment);
-            console.log("Emails in attachment:", emailsInAttachment.join(", "));
-            storeEmailsToData(emailsInAttachment, phoneNumbersInAttachment);
-            attachmentPaths.push(filePath); // Collect the file path for later deletion
-          }
-        }
-      }
-    } catch (parseError) {
-      console.error("Error parsing email:", parseError);
-    }
-  } catch (err) {
-    console.error("The API returned an error:", err);
-    if (retries > 0) {
-      console.log(`Retrying... (${MAX_RETRIES - retries + 1})`);
-      setTimeout(
-        () => getMessage(auth, messageId, emailType, retries - 1),
-        RETRY_DELAY
-      ); // Retry after delay
-    }
+  if (result.skipped) console.log(`Drafts and chats skipped: ${result.skipped}`);
+  if (result.warnings.length) {
+    console.log(`Attachments that could not be read: ${result.warnings.length}`);
+    for (const w of result.warnings.slice(0, 5)) console.log(`  - ${w}`);
+  }
+  if (result.failed.length) {
+    console.log(`Emails that could not be read (left out): ${result.failed.length}`);
+    for (const f of result.failed.slice(0, 5)) console.log(`  - email ${f.id}: ${f.error}`);
   }
 }
 
-function saveAttachment(attachment) {
-  const filePath = path.join(__dirname, "attachments", attachment.filename);
-  fs.writeFileSync(filePath, attachment.content);
-  return filePath;
-}
-
-async function parseDOCX(filePath) {
-  try {
-    const result = await mammoth.extractRawText({ path: filePath });
-    return extractEmailsFromText(result.value);
-  } catch (err) {
-    console.error("Error parsing DOCX:", err);
-    return [];
-  }
-}
-
-async function parsePDF(filePath) {
-  try {
-    const data = await pdf(fs.readFileSync(filePath));
-    return extractEmailsFromText(data.text);
-  } catch (err) {
-    console.error("Error parsing PDF:", err);
-    return [];
-  }
-}
-
-async function parseXLSX(filePath) {
-  try {
-    const workbook = xlsx.readFile(filePath);
-    let emails = [];
-    workbook.SheetNames.forEach((sheetName) => {
-      const worksheet = workbook.Sheets[sheetName];
-      const sheetData = xlsx.utils.sheet_to_json(worksheet, { header: 1 });
-      sheetData.forEach((row) => {
-        row.forEach((cell) => {
-          if (typeof cell === "string") {
-            emails = emails.concat(extractEmailsFromText(cell));
-          }
-        });
-      });
-    });
-    return emails;
-  } catch (err) {
-    console.error("Error parsing XLSX:", err);
-    return [];
-  }
-}
-
-function extractEmailsFromText(text) {
-  const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)/gi;
-  return text.match(emailRegex) || [];
-}
-
-function extractPhoneNumbers(text) {
-  const phoneRegex =
-    /(\+?\d{1,4}[\s-]?)?(\(?\d{1,4}\)?[\s-]?)?\d{1,4}[\s-]?\d{1,4}[\s-]?\d{1,9}/gi;
-  return text.match(phoneRegex) || [];
-}
-
-async function parseAttachments(filePath) {
-  const extension = path.extname(filePath).toLowerCase();
-  let emails = [];
-  switch (extension) {
-    case ".docx":
-      emails = await parseDOCX(filePath);
-      break;
-    case ".pdf":
-      emails = await parsePDF(filePath);
-      break;
-    case ".xlsx":
-      emails = await parseXLSX(filePath);
-      break;
-  }
-  return emails;
-}
-
-function storeEmailsToData(emails, phoneNumbers) {
-  emails.forEach((email) => {
-    emailData.push({
-      name: email.name || "",
-      email: email.email,
-      phone: phoneNumbers.join(", ") || "",
-    });
+if (require.main === module) {
+  main().catch((err) => {
+    // Print only the message: full error objects can include request details.
+    console.error(`Error: ${(err && err.message) || err}`);
+    process.exitCode = 1;
   });
 }
 
-function storeEmailsToExcel() {
-  const worksheet = xlsx.utils.json_to_sheet(emailData);
-  const workbook = xlsx.utils.book_new();
-  xlsx.utils.book_append_sheet(workbook, worksheet, "Emails");
-  xlsx.writeFile(workbook, "extracted_emails.xlsx");
-}
-
-function cleanUpAttachments() {
-  attachmentPaths.forEach((filePath) => {
-    fs.unlink(filePath, (err) => {
-      if (err) {
-        console.error(`Error deleting attachment ${filePath}:`, err);
-      } else {
-        console.log(`Attachment ${filePath} deleted.`);
-      }
-    });
-  });
-}
-
-// Increase the max number of listeners to avoid the warning
-require("events").EventEmitter.defaultMaxListeners = MAX_LISTENERS;
-
-// Call these functions at the end of processing
-process.on("exit", () => {
-  storeEmailsToExcel();
-  cleanUpAttachments();
-});
-
-// code below is working fine and it exctract email only
-
-// const fs = require("fs");
-// const path = require("path");
-// const readline = require("readline");
-// const { google } = require("googleapis");
-// const { simpleParser } = require("mailparser");
-// const mammoth = require("mammoth");
-// const pdf = require("pdf-parse");
-// const xlsx = require("xlsx");
-
-// const TOKEN_PATH = "token.json";
-// const MAX_LISTENERS = 20; // Set a higher limit for event listeners
-// const EMAIL_START_DATE = "2000/01/01"; // Set this to the earliest possible date to fetch all emails
-// const MAX_RETRIES = 5; // Number of retries for network errors
-// const RETRY_DELAY = 2000; // Delay between retries in milliseconds
-
-// let emailSet = new Set(); // To store and filter duplicate emails
-
-// // Load client secrets from a local file.
-// fs.readFile("credentials.json", (err, content) => {
-//   if (err) return console.log("Error loading client secret file:", err);
-//   authorize(JSON.parse(content), listLabels);
-// });
-
-// function authorize(credentials, callback) {
-//   const { client_secret, client_id, redirect_uris } =
-//     credentials.installed || credentials.web;
-//   if (!redirect_uris || redirect_uris.length === 0) {
-//     return console.error(
-//       "Redirect URIs are not defined in the credentials.json"
-//     );
-//   }
-//   const oAuth2Client = new google.auth.OAuth2(
-//     client_id,
-//     client_secret,
-//     redirect_uris[0]
-//   );
-
-//   fs.readFile(TOKEN_PATH, (err, token) => {
-//     if (err) return getNewToken(oAuth2Client, callback);
-//     oAuth2Client.setCredentials(JSON.parse(token));
-//     callback(oAuth2Client);
-//   });
-// }
-
-// function getNewToken(oAuth2Client, callback) {
-//   const authUrl = oAuth2Client.generateAuthUrl({
-//     access_type: "offline",
-//     scope: ["https://www.googleapis.com/auth/gmail.readonly"],
-//   });
-//   console.log("Authorize this app by visiting this url:", authUrl);
-//   const rl = readline.createInterface({
-//     input: process.stdin,
-//     output: process.stdout,
-//   });
-//   rl.question("Enter the code from that page here: ", (code) => {
-//     rl.close();
-//     oAuth2Client.getToken(code, (err, token) => {
-//       if (err) return console.error("Error retrieving access token", err);
-//       oAuth2Client.setCredentials(token);
-//       fs.writeFile(TOKEN_PATH, JSON.stringify(token), (err) => {
-//         if (err) return console.error(err);
-//         console.log("Token stored to", TOKEN_PATH);
-//       });
-//       callback(oAuth2Client);
-//     });
-//   });
-// }
-
-// function listLabels(auth) {
-//   const gmail = google.gmail({ version: "v1", auth });
-//   gmail.users.labels.list({ userId: "me" }, (err, res) => {
-//     if (err) return console.log("The API returned an error: " + err);
-//     const labels = res.data.labels;
-//     if (!labels || labels.length === 0) {
-//       console.log("No labels found.");
-//       return;
-//     }
-//     labels.forEach((label) => {
-//       listMessagesFromLabel(auth, label.id);
-//     });
-//   });
-// }
-
-// function listMessagesFromLabel(auth, labelId) {
-//   const gmail = google.gmail({ version: "v1", auth });
-//   gmail.users.messages.list(
-//     {
-//       userId: "me",
-//       labelIds: [labelId],
-//       q: `after:${EMAIL_START_DATE.replace(/\//g, "-")}`, // Fetch emails since the start date
-//     },
-//     (err, res) => {
-//       if (err) return console.log("The API returned an error: " + err);
-//       const messages = res.data.messages;
-//       if (!messages || messages.length === 0) {
-//         console.log(`No messages found in label ${labelId}.`);
-//         return;
-//       }
-//       console.log(`Messages in label ${labelId}:`);
-//       messages.forEach((message) => {
-//         if (labelId === "SENT") {
-//           getMessage(auth, message.id, "to");
-//         } else {
-//           getMessage(auth, message.id, "from");
-//         }
-//       });
-//     }
-//   );
-// }
-
-// async function getMessage(auth, messageId, emailType, retries = MAX_RETRIES) {
-//   const gmail = google.gmail({ version: "v1", auth });
-//   try {
-//     const res = await gmail.users.messages.get({
-//       userId: "me",
-//       id: messageId,
-//       format: "raw", // Ensure the raw format is requested
-//     });
-//     const msg = res.data;
-//     if (!msg.raw) {
-//       console.log("No raw data found for message:", messageId);
-//       return;
-//     }
-
-//     try {
-//       const parsed = await simpleParser(Buffer.from(msg.raw, "base64"));
-
-//       let emails = [];
-//       if (emailType === "from") {
-//         const from = parsed.from.value[0].address;
-//         emails.push(from);
-//         console.log("From:", from);
-//       } else if (emailType === "to") {
-//         const to = parsed.to.value.map((to) => to.address);
-//         emails = emails.concat(to);
-//         console.log("To:", to.join(", "));
-//       }
-
-//       // Store the emails in a file
-//       storeEmailsToFile(emails);
-
-//       if (parsed.attachments && parsed.attachments.length > 0) {
-//         for (const attachment of parsed.attachments) {
-//           if (attachment.filename) {
-//             const filePath = saveAttachment(attachment);
-//             const emailsInAttachment = await parseAttachments(filePath);
-//             console.log("Emails in attachment:", emailsInAttachment.join(", "));
-//             storeEmailsToFile(emailsInAttachment);
-//             cleanUpAttachment(filePath); // Clean up the attachment after processing
-//           }
-//         }
-//       }
-//     } catch (parseError) {
-//       console.error("Error parsing email:", parseError);
-//     }
-//   } catch (err) {
-//     console.error("The API returned an error:", err);
-//     if (retries > 0) {
-//       console.log(`Retrying... (${MAX_RETRIES - retries + 1})`);
-//       setTimeout(
-//         () => getMessage(auth, messageId, emailType, retries - 1),
-//         RETRY_DELAY
-//       ); // Retry after delay
-//     }
-//   }
-// }
-
-// function saveAttachment(attachment) {
-//   const filePath = path.join(__dirname, "attachments", attachment.filename);
-//   fs.writeFileSync(filePath, attachment.content);
-//   return filePath;
-// }
-
-// function cleanUpAttachment(filePath) {
-//   fs.unlink(filePath, (err) => {
-//     if (err) {
-//       console.error(`Error deleting attachment ${filePath}:`, err);
-//     } else {
-//       console.log(`Attachment ${filePath} deleted.`);
-//     }
-//   });
-// }
-
-// async function parseDOCX(filePath) {
-//   try {
-//     const result = await mammoth.extractRawText({ path: filePath });
-//     return extractEmailsFromText(result.value);
-//   } catch (err) {
-//     console.error("Error parsing DOCX:", err);
-//     return [];
-//   }
-// }
-
-// async function parsePDF(filePath) {
-//   try {
-//     const data = await pdf(fs.readFileSync(filePath));
-//     return extractEmailsFromText(data.text);
-//   } catch (err) {
-//     console.error("Error parsing PDF:", err);
-//     return [];
-//   }
-// }
-
-// async function parseXLSX(filePath) {
-//   try {
-//     const workbook = xlsx.readFile(filePath);
-//     let emails = [];
-//     workbook.SheetNames.forEach((sheetName) => {
-//       const worksheet = workbook.Sheets[sheetName];
-//       const sheetData = xlsx.utils.sheet_to_json(worksheet, { header: 1 });
-//       sheetData.forEach((row) => {
-//         row.forEach((cell) => {
-//           if (typeof cell === "string") {
-//             emails = emails.concat(extractEmailsFromText(cell));
-//           }
-//         });
-//       });
-//     });
-//     return emails;
-//   } catch (err) {
-//     console.error("Error parsing XLSX:", err);
-//     return [];
-//   }
-// }
-
-// function extractEmailsFromText(text) {
-//   const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)/gi;
-//   return text.match(emailRegex) || [];
-// }
-
-// async function parseAttachments(filePath) {
-//   const extension = path.extname(filePath).toLowerCase();
-//   let emails = [];
-//   switch (extension) {
-//     case ".docx":
-//       emails = await parseDOCX(filePath);
-//       break;
-//     case ".pdf":
-//       emails = await parsePDF(filePath);
-//       break;
-//     case ".xlsx":
-//       emails = await parseXLSX(filePath);
-//       break;
-//   }
-//   cleanUpAttachment(filePath); // Clean up the attachment after parsing
-//   return emails;
-// }
-
-// function storeEmailsToFile(emails) {
-//   emails.forEach((email) => {
-//     emailSet.add(email);
-//   });
-//   const filePath = path.join(__dirname, "extracted_emails.txt");
-//   fs.writeFileSync(filePath, Array.from(emailSet).join("\n"), "utf8");
-// }
-
-// // Increase the max number of listeners to avoid the warning
-// require("events").EventEmitter.defaultMaxListeners = MAX_LISTENERS;
+module.exports = { parseOptions };

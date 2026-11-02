@@ -1,8 +1,17 @@
 node_modules/
 .env
+
+# Google sign-in files: these give access to the mailbox. Never commit them.
 credentials.json
 token.json
 token2.json
+
+# Results contain personal data (names, email addresses, phone numbers),
+# whatever name they are saved under.
+*.xlsx
+*.xlsx.tmp
+
+# Left over from older versions
 attachments/
 extracted_mails.txt
 extracted_mails.xlsx
